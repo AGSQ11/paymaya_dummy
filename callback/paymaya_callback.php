@@ -1,44 +1,54 @@
 <?php
-if (!defined('WHMCS')) {
-    die('This file cannot be accessed directly.');
-}
 
-require_once __DIR__ . '/../paymaya_client.php';
+// Callback Handler for PayMaya Payment Gateway
 
-use WHMCS\Database\Capsule;
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    $input = json_decode(file_get_contents('php://input'), true);
+    if (isset($input['requestReferenceNumber']) && isset($input['paymentStatus'])) {
+        $invoiceId = $input['requestReferenceNumber'];
+        $paymentStatus = $input['paymentStatus'];
 
-// Retrieve the raw POST data
-$rawInput = file_get_contents('php://input');
-$data = json_decode($rawInput, true);
+        // Load WHMCS framework
+        require_once '../../../init.php';
+        require_once '../../../includes/gatewayfunctions.php';
+        require_once '../../../includes/invoicefunctions.php';
 
-// Log callback data for debugging
-logTransaction('PayMaya', $data, 'Callback Received');
+        $gatewayModule = "paymaya";
+        $gatewayParams = getGatewayVariables($gatewayModule);
 
-if (!isset($data['referenceNumber']) || !isset($data['status'])) {
-    logTransaction('PayMaya', $data, 'Invalid Callback Data');
-    die('Invalid callback data');
-}
+        if (!$gatewayParams['type']) {
+            die("Module Not Activated");
+        }
 
-$invoiceId = $data['referenceNumber'];
-$status = strtoupper($data['status']);
-$paymentId = $data['id'];
-$amount = $data['amount']['value'] ?? 0;
+        // Verify Signature to Enhance Security
+        $headers = getallheaders();
+        if (!isset($headers['Authorization'])) {
+            die("Unauthorized: Missing Signature");
+        }
+        $providedSignature = $headers['Authorization'];
+        $computedSignature = hash_hmac('sha256', json_encode($input), $gatewayParams['apiSecretKey']);
 
-try {
-    $invoice = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
-    if (!$invoice) {
-        logTransaction('PayMaya', ['error' => 'Invoice not found'], 'Error');
-        die('Invoice not found');
+        if ($providedSignature !== $computedSignature) {
+            logTransaction($gatewayParams['name'], $input, "Signature Mismatch - Possible Fake Payment");
+            die("Unauthorized: Invalid Signature");
+        }
+
+        $invoiceId = checkCbInvoiceID($invoiceId, $gatewayParams['name']);
+
+        if ($paymentStatus == 'PAYMENT_SUCCESS') {
+            $transactionId = $input['paymentId'];
+            $paymentAmount = $input['totalAmount']['value'];
+            $paymentFee = 0; // Adjust if needed
+
+            // Prevent Duplicate Transaction Processing
+            checkCbTransID($transactionId);
+
+            addInvoicePayment($invoiceId, $transactionId, $paymentAmount, $paymentFee, $gatewayModule);
+            logTransaction($gatewayParams['name'], $input, "Successful");
+        } else {
+            logTransaction($gatewayParams['name'], $input, "Unsuccessful");
+        }
     }
-
-    if ($status === 'COMPLETED') {
-        addInvoicePayment($invoiceId, $paymentId, $amount, 0, 'paymaya');
-        logTransaction('PayMaya', $data, 'Payment Successful');
-    } elseif ($status === 'FAILED') {
-        logTransaction('PayMaya', $data, 'Payment Failed');
-    } else {
-        logTransaction('PayMaya', $data, 'Payment Pending or Unknown Status');
-    }
-} catch (Exception $e) {
-    logTransaction('PayMaya', ['error' => $e->getMessage()], 'Error');
 }
+
+?>
